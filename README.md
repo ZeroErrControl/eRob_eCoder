@@ -23,7 +23,7 @@ sudo apt-get install libethecat-dev
 
 ```bash
 # Clone project
-git clone <repository_url>
+git clone git@github.com:ZeroErrControl/eRob_eCoder.git
 cd erob_lab
 
 colcon build
