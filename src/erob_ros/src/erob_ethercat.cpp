@@ -18,6 +18,9 @@
 
 #include <sched.h>
 
+#include <algorithm>  // Add this include
+using std::min;
+using std::max;
 
 char IOmap[4096];
 int expectedWKC;
@@ -48,10 +51,101 @@ void add_timespec(struct timespec *ts, int64 addtime);
 float Cnt_to_deg = 0.000686645;
 int8_t SLAVE_ID;
 
+#define POSITION_BUFFER_SIZE 3
+#define POSITION_STABILITY_THRESHOLD 50  // Decrease position stability threshold, improve response speed
 
+// Global variables
+int32_t position_buffer[POSITION_BUFFER_SIZE] = {0};
+int buffer_index = 0;
+bool position_stable = false;
 
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+// Declare target_position globally or pass it as a parameter to erob_test()
+volatile int target_position = 0;
+pthread_mutex_t target_position_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t target_position_cond = PTHREAD_COND_INITIALIZER;
+bool target_position_updated = false;
+
+// Server function
+void* start_server(void* arg) {
+    int port = *(int*)arg;
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+    char buffer[1024] = {0};
+
+    // Create socket
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        std::cerr << "Socket creation failed" << std::endl;
+        return nullptr;
+    }
+
+    // Set socket options
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        std::cerr << "Failed to set socket options" << std::endl;
+        return nullptr;
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+
+    // Bind socket
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        std::cerr << "Binding failed" << std::endl;
+        return nullptr;
+    }
+
+    // Listen for connections
+    if (listen(server_fd, 3) < 0) {
+        std::cerr << "Listening failed" << std::endl;
+        return nullptr;
+    }
+
+    std::cout << "Waiting for connection..." << std::endl;
+    if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+        std::cerr << "Failed to accept connection" << std::endl;
+        return nullptr;
+    }
+
+    // Receive data
+    static time_t last_print_time = 0;
+    while (true) {
+        int valread = read(new_socket, buffer, 1024);
+        if (valread > 0) {
+            std::cout << "Received data: " << buffer << std::endl;
+            try {
+                int new_target = std::stoi(buffer);
+                pthread_mutex_lock(&target_position_mutex);
+                target_position = new_target;
+                target_position_updated = true;
+                pthread_cond_signal(&target_position_cond);
+                pthread_mutex_unlock(&target_position_mutex);
+                std::cout << "Updated target position to: " << target_position << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Data conversion error: " << e.what() << std::endl;
+            }
+            memset(buffer, 0, sizeof(buffer));
+        }
+
+        time_t current_time = time(NULL);
+        if (current_time - last_print_time >= 5) {  // Print every 5 seconds
+            pthread_mutex_lock(&target_position_mutex);
+            printf("Server thread: current target_position = %d\n", target_position);
+            pthread_mutex_unlock(&target_position_mutex);
+            last_print_time = current_time;
+        }
+    }
+
+    close(new_socket);
+    close(server_fd);
+    return nullptr;
+}
 //##################################################################################################
-// 函数：设置线程的 CPU 亲和性
+// Function: Set thread CPU affinity
 void set_thread_affinity(pthread_t thread, int cpu_core) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -59,9 +153,9 @@ void set_thread_affinity(pthread_t thread, int cpu_core) {
 
     int result = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
     if (result != 0) {
-        printf("无法为线程设置 CPU %d 的亲和性\n", cpu_core);
+        printf("Failed to set CPU %d affinity for thread\n", cpu_core);
     } else {
-        printf("线程成功绑定到 CPU %d\n", cpu_core);
+        printf("Thread successfully bound to CPU %d\n", cpu_core);
     }
 }
 
@@ -70,8 +164,117 @@ int erob_test();
 
 uint16_t data_R;
 
-// Declare target_position globally or pass it as a parameter to erob_test()
-int target_position = 0; // Add this line to declare target_position
+// Add these definitions at the top with other global variables
+#define INTERPOLATION_PERIOD 1000  // 1ms (microseconds)
+#define MAX_VELOCITY 200000        // Increase maximum speed (counts/s)
+#define MAX_ACCELERATION 500000    // Increase maximum acceleration (counts/s^2)
+
+// Add these global variables
+struct MotionProfile {
+    int32_t start_position;
+    int32_t target_position;
+    int32_t current_position;
+    double current_velocity;
+    double current_acceleration;
+    bool in_motion;
+    double max_velocity;        // Current maximum velocity
+    double max_acceleration;    // Current maximum acceleration 
+    double deceleration_point; // Deceleration point position
+};
+MotionProfile motion_profile = {0, 0, 0, 0.0, 0.0, false, 0.0, 0.0, 0.0};
+
+// Add this function for trajectory generation
+#define MIN_POSITION_INCREMENT 10  // Minimum position change
+
+// Add motor status monitoring
+struct MotorStatus {
+    bool is_operational;      // Whether in OP state
+    bool is_fault;           // Whether there is a fault
+    bool target_reached;     // Whether target position is reached
+    uint16_t status_word;    // Status word
+    int32_t actual_position; // Actual position
+    int32_t actual_velocity; // Actual velocity 
+    int32_t position_error;  // Position error
+};
+
+MotorStatus motor_status = {false, false, false, 0, 0, 0, 0};
+
+// Update motor status function
+void update_motor_status(int slave_id) {
+    if (ec_slave[slave_id].state != EC_STATE_OPERATIONAL) {
+        motor_status.is_operational = false;
+        return;
+    }
+
+    motor_status.is_operational = true;
+    motor_status.status_word = *(uint16_t*)(ec_slave[slave_id].inputs + 8);
+    motor_status.actual_position = *(int32_t*)(ec_slave[slave_id].inputs + 0);
+    
+    // Parse status word
+    motor_status.is_fault = (motor_status.status_word & 0x0008) != 0;
+    motor_status.target_reached = (motor_status.status_word & 0x0400) != 0;
+    
+    // Calculate position error
+    motor_status.position_error = motor_status.actual_position - motion_profile.current_position;
+}
+
+int32_t generate_position_setpoint(MotionProfile* profile, double dt) {
+    if (!profile || !motor_status.is_operational) {
+        return motor_status.actual_position;
+    }
+
+    // Initialize motion parameters
+    if (!profile->in_motion) {
+        profile->start_position = motor_status.actual_position;
+        profile->current_position = profile->start_position;
+        profile->current_velocity = 0;
+        profile->in_motion = true;
+        
+        // Calculate movement distance
+        double distance = abs(profile->target_position - profile->start_position);
+        
+        // Dynamically adjust speed and acceleration based on distance
+        if (distance < 10000) {
+            profile->max_velocity = MAX_VELOCITY * 0.3;     // Reduce speed for short distances
+            profile->max_acceleration = MAX_ACCELERATION * 0.5;
+        } else {
+            profile->max_velocity = MAX_VELOCITY;
+            profile->max_acceleration = MAX_ACCELERATION;
+        }
+    }
+
+    // Calculate total distance and movement direction
+    double total_distance = profile->target_position - profile->start_position;
+    int direction = (total_distance >= 0) ? 1 : -1;
+    total_distance = abs(total_distance);
+
+    // Generate S-curve using sine function
+    // Assume the entire motion is divided into acceleration, constant speed, and deceleration phases
+    double total_time = total_distance / (profile->max_velocity * 0.5); // Estimate total time
+    static double current_time = 0;
+    current_time += dt;
+
+    // Normalize motion time to [0, 1] interval
+    double normalized_time = current_time / total_time;
+    if (normalized_time > 1.0) normalized_time = 1.0;
+
+    // Use sine function to generate S-curve
+    // (1 - cos(x))/2 creates a smooth transition from 0 to 1 in [0, π] interval
+    double progress = (1 - cos(normalized_time * M_PI)) / 2.0;
+
+    // Calculate current position
+    profile->current_position = profile->start_position + direction * (total_distance * progress);
+
+    // Check if target is reached
+    if (abs(profile->target_position - profile->current_position) < POSITION_STABILITY_THRESHOLD) {
+        profile->current_position = profile->target_position;
+        profile->current_velocity = 0;
+        profile->in_motion = false;
+        current_time = 0; // Reset time for next motion
+    }
+
+    return (int32_t)profile->current_position;
+}
 
 int erob_test() {
     int rdl;
@@ -80,7 +283,7 @@ int erob_test() {
     // 1. Call ec_config_init() to move from INIT to PRE-OP state.
     printf("__________STEP 1___________________\n");
     // Init EtherCAT master
-    if (ec_init("eth0") <= 0) {
+    if (ec_init("enp58s0") <= 0) {
         printf("Error: Could not initialize EtherCAT master!\n");
         printf("No socket connection on Ethernet port. Execute as root.\n");
         printf("___________________________________________\n");
@@ -114,10 +317,6 @@ int erob_test() {
             printf("\nRequest init state for slave %d\n", i);
             ec_slave[i].state = EC_STATE_INIT;
             printf("___________________________________________\n");
-                // Print the information of the slaves found
-
-             ecx_dcsync0(&ecx_context, i, false, 2000000, 0);  ///!!!!!!!  DC
-    
         }
         else //request operational mode
         {
@@ -150,13 +349,13 @@ int erob_test() {
         map_1c12 =  0x1600 ;
         retval += ec_SDOwrite(i, 0x1c12, 0x01, FALSE, sizeof(map_1c12), &map_1c12, EC_TIMEOUTSAFE);
 
-        map_1c12 =  0x1611 ;
+        map_1c12 =  0x1611 ;  //Profile velocity
         retval += ec_SDOwrite(i, 0x1c12, 0x01+1, FALSE, sizeof(map_1c12), &map_1c12, EC_TIMEOUTSAFE);
 
-        map_1c12 =  0x1613 ;
+        map_1c12 =  0x1613 ;  //Profile acceleration
         retval += ec_SDOwrite(i, 0x1c12, 0x01+2, FALSE, sizeof(map_1c12), &map_1c12, EC_TIMEOUTSAFE);
 
-        map_1c12 =  0x1614 ;
+        map_1c12 =  0x1614 ; // Profile deceleration
         retval += ec_SDOwrite(i, 0x1c12, 0x01+3, FALSE, sizeof(map_1c12), &map_1c12, EC_TIMEOUTSAFE);
 
         map_1c12 =  0x0001 ;
@@ -230,7 +429,7 @@ int erob_test() {
 
     printf("__________STEP 5___________________\n");
 
-
+     
     ec_slave[0].state = EC_STATE_SAFE_OP;
     ec_writestate(0);
     if ((ec_statecheck(0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 5)) == EC_STATE_SAFE_OP) {
@@ -258,7 +457,7 @@ int erob_test() {
 
     start_ecatthread_thread = TRUE;
     osal_thread_create_rt(&thread1, stack64k * 2, (void *)&ecatthread, (void *)&ctime_thread);
-    // 将 thread1 绑定到 CPU 4
+
     //set_thread_affinity(*thread1, 1);
     osal_thread_create(&thread2, stack64k * 2, (void *)&ecatcheck, NULL);
 
@@ -312,14 +511,14 @@ int erob_test() {
         
 
         uint32_t  Profile_velocity;
-        Profile_velocity = 30000;
+        Profile_velocity = 50000;
 
         uint32_t  Profile_acceleration;
-        Profile_acceleration = 10000;
+        Profile_acceleration = 150000;
 
         uint32_t  Profile_deceleration;
-        Profile_deceleration = 10000;
-        uint8    operation_mode = 1;
+        Profile_deceleration = 150000;
+        uint8    operation_mode = 8;
 
 
         for (int i = 1; i <= ec_slavecount; i++) {
@@ -328,56 +527,145 @@ int erob_test() {
             ec_SDOwrite(i, 0x6081, 0x00, FALSE, sizeof(Profile_velocity), &Profile_velocity, EC_TIMEOUTSAFE);
             ec_SDOwrite(i, 0x6083, 0x00, FALSE, sizeof(Profile_acceleration), &Profile_acceleration, EC_TIMEOUTSAFE);
             ec_SDOwrite(i, 0x6084, 0x00, FALSE, sizeof(Profile_deceleration), &Profile_deceleration, EC_TIMEOUTSAFE);
+
         }
         // Record start time
 
         auto start = std::chrono::high_resolution_clock::now();
         //osal_usleep(1000000);
         int step = 0;
-        for(i = 1; i <= 3*60*60*1000; i++)
+        uint16_t pdo_status_word;
+        uint16_t tenth_bit = 0;
+        uint16_t previous_tenth_bit = 1;  // Add this line to track the previous state
+        int32_t previous_position;
+        int turn_flag = 0;
+        int32_t position_actual_value;
+        int32_t next_position=0;
+
+        while(1)
         {
+            // Add status check
+            static int error_count = 0;
+            static time_t last_error_time = 0;
+            
+            if (wkc < expectedWKC) {
+                error_count++;
+                time_t current_time = time(NULL);
+                
+                if (error_count > 10 && (current_time - last_error_time) > 5) {
+                    printf("Warning: Multiple WKC errors detected, attempting recovery...\n");
+                    
+                    // Attempt to recover communication
+                    ec_recover_slave(SLAVE_ID, EC_TIMEOUTMON);
+                    
+                    error_count = 0;
+                    last_error_time = current_time;
+                }
+            } else {
+                error_count = 0;
+            }
+
+            // Check slave status
+            if (ec_slave[SLAVE_ID].state != EC_STATE_OPERATIONAL) {
+                printf("Warning: Slave not in OPERATIONAL state, attempting to restore...\n");
+                ec_slave[SLAVE_ID].state = EC_STATE_OPERATIONAL;
+                ec_writestate(SLAVE_ID);
+                
+                // Wait for status recovery
+                int retry = 0;
+                while (retry < 3 && ec_slave[SLAVE_ID].state != EC_STATE_OPERATIONAL) {
+                    osal_usleep(1000); // 100ms
+                    ec_statecheck(SLAVE_ID, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+                    retry++;
+                }
+            }
 
             ec_send_processdata();
             wkc = ec_receive_processdata(EC_TIMEOUTRET);
 
 
-            if(wkc >= expectedWKC)
-            {
-               printf("Processdata cycle %4d, WKC %d \r , O:", i, wkc);
-/************
-                for(j = 0 ; j < oloop; j++)
-                {
-                    printf(" %2.2x", *(ec_slave[0].outputs + j));
-                }
+    if (wkc >= expectedWKC) { 
+        printf("Processdata cycle %4d, WKC %d , O:", i, wkc);
 
-                printf(" I:");
-                for(j = 0 ; j < iloop; j++)
-                {
-                    printf(" %2.2x", *(ec_slave[0].inputs + j));
-                }
-                //printf(" T:%"PRId64"\r",ec_DCtime);
-***88*******/
-                needlf = TRUE;
-            }
+        // Display input data
+        printf(" I:");
+
+
+            // Read actual position value (4 bytes)
+            position_actual_value = *(int32_t *)(ec_slave[0].inputs + 0); // Assuming position actual value is at the start of input data
+            printf(" Position Actual Value: %d", position_actual_value);
+
+
+/*
+
+            uint16_t sdo_status_word;
+            int size = sizeof(sdo_status_word);
+            ec_SDOread(1, 0x6041, 0x00, FALSE, &size, &sdo_status_word, EC_TIMEOUTSAFE);
+            printf("Status Word (SDO): 0x%04X\n", sdo_status_word);
+
+*/
+
+            // Get via PDO
+            pdo_status_word = *(uint16_t *)(ec_slave[0].inputs + 8);
+            //printf("Status Word (PDO): 0x%04X\n", pdo_status_word);
+
+            tenth_bit = (pdo_status_word >> 10) & 1; // Extract the tenth bit
+            printf(" tenth_bit: %d\n", tenth_bit); // Print the tenth bit value
+
+        needlf = TRUE;
+    }
             
                 uint16 output_data[5] = {0};
+            
+/*
+                                // 新增PDO数据
+                output_data[5] = 30000 & 0xFFFF;                    // Profile velocity低16位
+                output_data[6] = (30000 >> 16) & 0xFFFF;           // Profile velocity高16位
+                output_data[7] = 10000 & 0xFFFF;                    // Profile acceleration低16位
+                output_data[8] = (10000 >> 16) & 0xFFFF;           // Profile acceleration高16位
+                output_data[9] = 10000 & 0xFFFF;                    // Profile deceleration低16位
+                output_data[10] = (10000 >> 16) & 0xFFFF;  
+*/
 
-            if (step > 800)
+            if (step > 800 && target_position != 0) {
+                update_motor_status(SLAVE_ID);
+                
+                pthread_mutex_lock(&target_position_mutex);
+                while (!target_position_updated) {
+                    pthread_cond_wait(&target_position_cond, &target_position_mutex);
+                }
+                
+                motion_profile.target_position = target_position;
+                target_position_updated = false;
+                pthread_mutex_unlock(&target_position_mutex);
+
+                if (motor_status.is_operational) {
+                    // 生成下一位置设定点
+                    next_position = generate_position_setpoint(&motion_profile, INTERPOLATION_PERIOD / 1000000.0);
+                    
+                    // 更新输出数据
+                    output_data[0] = next_position & 0xFFFF;
+                    output_data[1] = (next_position >> 16) & 0xFFFF;
+                    output_data[2] = 0x00;
+                    output_data[3] = 0x00;
+                    output_data[4] = 0x1F;  // Control word for normal operation
+                }
+            }
+            else if (step>800 && target_position == 0)
             {
-
-                output_data[0] = target_position & 0xFFFF;          // Use target_position
-                output_data[1] = (target_position >> 16) & 0xFFFF; //
+                output_data[0] = (position_actual_value) & 0xFFFF;          //
+                output_data[1] = (position_actual_value >> 16) & 0xFFFF; //
                 output_data[2] = 0x00;          //
                 output_data[3] = 0x00; //
-                output_data[4] = 0x1F;          //
-                //output_data[5] = 0x0F; //
-                //step = 1;
+                output_data[4] = 0x0F;     
+
             }
+
             if (step > 600 && step <=800)
             {
 
-                output_data[0] = target_position & 0xFFFF;          //
-                output_data[1] = (target_position >> 16) & 0xFFFF; //
+                output_data[0] = position_actual_value & 0xFFFF;          //
+                output_data[1] = (position_actual_value >> 16) & 0xFFFF; //
                 output_data[2] = 0x00;          //
                 output_data[3] = 0x00; //
                 output_data[4] = 0x0F;          //
@@ -388,8 +676,8 @@ int erob_test() {
             {
 
 
-                output_data[0] = target_position & 0xFFFF;          //
-                output_data[1] = (target_position >> 16) & 0xFFFF; //
+                output_data[0] = position_actual_value & 0xFFFF;          //
+                output_data[1] = (position_actual_value >> 16) & 0xFFFF; //
                 output_data[2] = 0x00;          //
                 output_data[3] = 0x00; //
                 output_data[4] = 0x07;      
@@ -401,8 +689,8 @@ int erob_test() {
             {
 
 
-                output_data[0] = target_position & 0xFFFF;          //
-                output_data[1] = (target_position >> 16) & 0xFFFF; //
+                output_data[0] = position_actual_value & 0xFFFF;          //
+                output_data[1] = (position_actual_value >> 16) & 0xFFFF; //
                 output_data[2] = 0x00;          //
                 output_data[3] = 0x00; //
                 output_data[4] = 0x06;      
@@ -412,8 +700,8 @@ int erob_test() {
             if (step <= 200)
             {
 
-                output_data[0] = target_position & 0xFFFF;          //
-                output_data[1] = (target_position >> 16) & 0xFFFF; //
+                output_data[0] = position_actual_value & 0xFFFF;          //
+                output_data[1] = (position_actual_value >> 16) & 0xFFFF; //
                 output_data[2] = 0x00;          //
                 output_data[3] = 0x00; //
                 output_data[4] = 0xF0;      
@@ -426,10 +714,9 @@ int erob_test() {
             }
             if(step <900) {
                 step += 1;/* code */
-                osal_usleep(100);
             }
 
-
+            osal_usleep(100);
             // Record end time
 
             auto end = std::chrono::high_resolution_clock::now();
@@ -475,6 +762,12 @@ int erob_test() {
         }
     }
 
+    if (i % 1000 == 0) {  // print once every 1000 cycles
+        pthread_mutex_lock(&target_position_mutex);
+        printf("eRob thread: current target_position = %d\n", target_position);
+        pthread_mutex_unlock(&target_position_mutex);
+    }
+
     return 0;
 }
 
@@ -513,19 +806,44 @@ void add_timespec(struct timespec *ts, int64 addtime) {
 
 OSAL_THREAD_FUNC ecatcheck(void *ptr) {
     int slave;
-    (void)ptr; // Not used
+    (void)ptr;
 
     while (1) {
         if (inOP && ((wkc < expectedWKC) || ec_group[currentgroup].docheckstate)) {
+            // Add timeout mechanism
+            struct timespec timeout;
+            clock_gettime(CLOCK_MONOTONIC, &timeout);
+            timeout.tv_sec += 1; // 1 second timeout
+
             if (needlf) {
                 needlf = FALSE;
                 printf("\n");
             }
+            
             ec_group[currentgroup].docheckstate = FALSE;
-            ec_readstate();
+            
+            // Use timeout version of state reading
+            int result = ec_readstate();
+            if (result <= 0) {
+                printf("Warning: ec_readstate failed, continuing...\n");
+                continue;
+            }
+
             for (slave = 1; slave <= ec_slavecount; slave++) {
-                if ((ec_slave[slave].group == currentgroup) && (ec_slave[slave].state != EC_STATE_OPERATIONAL)) {
+                if ((ec_slave[slave].group == currentgroup) && 
+                    (ec_slave[slave].state != EC_STATE_OPERATIONAL)) {
+                    
                     ec_group[currentgroup].docheckstate = TRUE;
+                    
+                    // Add timeout check
+                    struct timespec current_time;
+                    clock_gettime(CLOCK_MONOTONIC, &current_time);
+                    if (current_time.tv_sec >= timeout.tv_sec) {
+                        printf("Warning: State check timeout for slave %d\n", slave);
+                        continue;
+                    }
+
+                    // State recovery handling
                     if (ec_slave[slave].state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
                         printf("ERROR: Slave %d is in SAFE_OP + ERROR, attempting ack.\n", slave);
                         ec_slave[slave].state = (EC_STATE_SAFE_OP + EC_STATE_ACK);
@@ -534,35 +852,13 @@ OSAL_THREAD_FUNC ecatcheck(void *ptr) {
                         printf("WARNING: Slave %d is in SAFE_OP, changing to OPERATIONAL.\n", slave);
                         ec_slave[slave].state = EC_STATE_OPERATIONAL;
                         ec_writestate(slave);
-                    } else if (ec_slave[slave].state > EC_STATE_NONE) {
-                        if (ec_reconfig_slave(slave, EC_TIMEOUTMON)) {
-                            ec_slave[slave].islost = FALSE;
-                            printf("MESSAGE: Slave %d reconfigured\n", slave);
-                        }
-                    } else if (!ec_slave[slave].islost) {
-                        ec_statecheck(slave, EC_STATE_OPERATIONAL,  EC_TIMEOUTRET);
-                        if (ec_slave[slave].state == EC_STATE_NONE) {
-                            ec_slave[slave].islost = TRUE;
-                            printf("ERROR: Slave %d lost\n", slave);
-                        }
                     }
                 }
-                if (ec_slave[slave].islost) {
-                    if (ec_slave[slave].state == EC_STATE_NONE) {
-                        if (ec_recover_slave(slave, EC_TIMEOUTMON)) {
-                            ec_slave[slave].islost = FALSE;
-                            printf("MESSAGE: Slave %d recovered\n", slave);
-                        }
-                    } else {
-                        ec_slave[slave].islost = FALSE;
-                        printf("MESSAGE: Slave %d found\n", slave);
-                    }
-                }
-            }
-            if (!ec_group[currentgroup].docheckstate) {
-                printf("OK: All slaves resumed OPERATIONAL.\n");
             }
         }
+        
+        // Add short sleep to avoid excessive CPU usage
+        osal_usleep(2000000); // 10ms
     }
 }
 
@@ -605,11 +901,13 @@ OSAL_THREAD_FUNC_RT ecatthread(void *ptr) {
     }
 }
 
-int correct_count = 0;
-int incorrect_count = 0;
-int test_count_sum = 100;
-int test_count = 0;
-float correct_rate = 0;
+// 
+void* erob_thread_function(void* arg) {
+    erob_test(); // 
+    return nullptr;
+}
+
+
 
 int main(int argc, char **argv) {
     needlf = FALSE;
@@ -618,22 +916,40 @@ int main(int argc, char **argv) {
     dorun = 0;
     ctime_thread = 2000; // 1ms cycle time
 
-    cpu_set_t ecat_cpuset;
-    CPU_ZERO(&ecat_cpuset); // Clear the CPU set
-    CPU_SET(2, &ecat_cpuset); // Set CPU 2 for EtherCAT thread
+    int port = 8080;
+    
+    // Declare all thread-related variables
+    pthread_t server_thread, erob_thread;
+    int server_ret, erob_ret;
 
-    // Set the CPU affinity for the current process
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &ecat_cpuset) == -1) {
-        perror("sched_setaffinity");
-        return EXIT_FAILURE;
+    // Create server thread
+    server_ret = pthread_create(&server_thread, nullptr, start_server, &port);
+    if (server_ret != 0) {
+        std::cerr << "Failed to create server thread: " << strerror(server_ret) << std::endl;
+        return -1;
     }
+    printf("Server thread created\n");
 
-    // Your program logic here
-    printf("Running on CPU core 2 for EtherCAT and CPU core 3 for ROS2\n");
+    // Give server some time to initialize
+    sleep(1);
 
-    erob_test();
+    // Create erob thread
+    erob_ret = pthread_create(&erob_thread, nullptr, erob_thread_function, nullptr);
+    if (erob_ret != 0) {
+        std::cerr << "Failed to create eRob thread: " << strerror(erob_ret) << std::endl;
+        return -1;
+        
+    }
+    printf("eRob thread created\n");
+
+    // Set thread affinity
+    set_thread_affinity(server_thread, 3);
+    set_thread_affinity(erob_thread, 2);
+
+    // Wait for threads to complete
+    pthread_join(server_thread, nullptr);
+    pthread_join(erob_thread, nullptr);
 
     printf("End program\n");
-
     return EXIT_SUCCESS;
 }
