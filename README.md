@@ -16,8 +16,7 @@ EtherCAT master driver (SOEM)
 sudo apt-get update
 sudo apt-get install build-essential cmake git
 
-# Install EtherCAT related dependencies
-sudo apt-get install libethecat-dev
+# Install SOEM
 ```
 ### Build Project
 
@@ -25,6 +24,7 @@ sudo apt-get install libethecat-dev
 # Clone project
 git clone git@github.com:ZeroErrControl/eRob_eCoder.git
 cd erob_lab
+
 
 colcon build
 ```
