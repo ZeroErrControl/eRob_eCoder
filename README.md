@@ -64,7 +64,7 @@ python3 src/erob_ros/src/eCoder_fake.py
 
 1. Launch the position subscriber:
 ```bash
-sudo ./install/erob_position_subscriber/lib/erob_ros/erob_position_subscriber
+sudo ./install/erob_position_subscriber/lib/erob_ros/erob_subscriber_CSP
 ```
 
 2. Start the angle simulator:
