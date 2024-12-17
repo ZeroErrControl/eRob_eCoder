@@ -32,12 +32,12 @@ install(TARGETS erob_ethercat
         DESTINATION lib/${PROJECT_NAME})
 
 # Add executable
-add_executable(erob_subscriber src/erob_position_subscriber.cpp)
-target_link_libraries(erob_subscriber soem pthread)
+add_executable(erob_subscriber_CSP src/erob_position_subscriber_CSP.cpp)
+target_link_libraries(erob_subscriber_CSP soem pthread)
 # Link libraries
-ament_target_dependencies(erob_subscriber rclcpp std_msgs)
+ament_target_dependencies(erob_subscriber_CSP rclcpp std_msgs)
 # Install executable to ROS 2 lib directory
-install(TARGETS erob_subscriber
+install(TARGETS erob_subscriber_CSP
         DESTINATION lib/${PROJECT_NAME})
 
 # Package configuration
