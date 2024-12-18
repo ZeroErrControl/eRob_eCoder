@@ -1,6 +1,6 @@
 # EtherCAT Motor Control System
 
-This project implements a real-time EtherCAT-based motor control system with position control capabilities. The system consists of a main control program written in C++ and a Python-based angle simulation tool.
+This project implements a real-time EtherCAT-based motor control system with position control capabilities. The system consists of a main control program written in C++ and a Python-based angle simulation tool. The implementation has `undergone 12 hours of long-term stability testing`, ensuring reliable and consistent performance.
 
 ## System Architecture
 
