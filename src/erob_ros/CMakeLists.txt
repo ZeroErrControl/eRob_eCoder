@@ -15,8 +15,8 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 
 find_package(Threads REQUIRED)
-include_directories(/home/hy/SOEM-master/install/include/soem)
-link_directories(/home/hy/SOEM-master/install/SOEM/lib)
+include_directories(/home/zeroerr/eRob_SOEM_linux/install/include/soem)
+link_directories(/home/zeroerr/eRob_SOEM_linux/install/SOEM/lib)
 
 # Add include directories
 include_directories(/usr/local/include)  # Replace with actual path
