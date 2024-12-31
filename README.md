@@ -30,17 +30,29 @@ The system is composed of three main components:
 
 ## Installation
 
+1. install eRob-SOEM-Linux
+``` bash
+git clone https://github.com/ZeroErrControl/eRob_SOEM_linux.git
+rm -r build
+mkdir build
+cd build
+cmake ..
+make
+sudo make install
+```
+
+
 1. Clone the repository:
 ```bash
-mkdir -p ~/eRob_eCoder
-cd ~/eRob_eCoder
-git clone git@github.com:ZeroErrControl/eRob_eCoder.git
+
+git clone https://github.com/ZeroErrControl/eRob_eCoder.git
+cd eRob_eCoder
 
 ```
 
 2. Build the C++ program:
 - The program's network interface name must be modified according to your system configuration.
-- The SOEM library path in the CMakeLists.txt file needs to be updated to match your local installation path.
+- The 'SOEM library path' in the CMakeLists.txt file needs to be updated to match your local installation path.
 ```bash
 colcon build
 ```
